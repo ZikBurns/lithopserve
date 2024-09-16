@@ -18,7 +18,7 @@ import os
 
 DEFAULT_CONFIG_KEYS = {
     'runtime_timeout': 600,  # Default: 10 minutes
-    'runtime_memory': 512,  # Default memory: 512 MB
+    'runtime_memory': 1024,  # Default memory: 512 MB
     'runtime_cpu': 1,  # 1 vCPU
     'max_workers': 100,
     'worker_processes': 1,
@@ -53,7 +53,8 @@ RUN pip install --upgrade --ignore-installed setuptools six pip \
         numpy \
         cloudpickle \
         ps-mem \
-        tblib
+        tblib \
+        psutil
 
 ENV PYTHONUNBUFFERED TRUE
 
@@ -105,14 +106,39 @@ spec:
                   fieldPath: status.podIP
           resources:
             requests:
-              cpu: '0.2'
-              memory: 128Mi
+              cpu: '1'
+              memory: 512Mi
             limits:
-              cpu: '0.2'
-              memory: 128Mi
+              cpu: '1'
+              memory: 512Mi
       imagePullSecrets:
         - name: lithops-regcred
 """
+
+POD = """
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lithops-worker
+spec:
+  containers:
+    - name: "lithops-worker"
+      image: "<INPUT>"
+      command: ["python3"]
+      args:
+        - "/lithops/lithopsentry.py"
+        - "--"
+        - "--"
+      resources:
+        requests:
+          cpu: '1'
+          memory: '512Mi'
+"""
+
+MASTER_CONFIG_RESOURCES = {
+    'requests': {'cpu': '0.5', 'memory': '512Mi'},
+    'limits': {'cpu': '1', 'memory': '512Mi'}
+}
 
 def load_config(config_data):
     for key in DEFAULT_CONFIG_KEYS:

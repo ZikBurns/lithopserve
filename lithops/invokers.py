@@ -82,7 +82,7 @@ class Invoker:
 
         self.mode = self.config['lithops']['mode']
         self.backend = self.config['lithops']['backend']
-        self.customized_runtime = self.config['lithops'].get('customized_runtime', False)
+        self.include_function = self.config[self.backend].get('runtime_include_function', False)
 
         self.runtime_info = self.compute_handler.get_runtime_info()
         self.runtime_name = self.runtime_info['runtime_name']
@@ -92,6 +92,22 @@ class Invoker:
 
         logger.debug(f'ExecutorID {self.executor_id} - Invoker initialized.'
                      f' Max workers: {self.max_workers}')
+
+    def get_runtime_meta(self, job_id, runtime_memory):
+        runtime_memory = runtime_memory or self.runtime_info['runtime_memory'] \
+            if self.mode == SERVERLESS else self.runtime_info['runtime_memory']
+        runtime_timeout = self.runtime_info['runtime_timeout']
+
+        msg = ('ExecutorID {} | JobID {} - Selected Runtime: {} '
+               .format(self.executor_id, job_id, self.runtime_name))
+        msg = msg + f'- {runtime_memory}MB' if runtime_memory else msg
+        logger.info(msg)
+
+        runtime_key = self.compute_handler.get_runtime_key(self.runtime_name, runtime_memory, __version__)
+        runtime_meta = self.internal_storage.get_runtime_meta(runtime_key)
+
+        return runtime_meta
+
 
     def select_runtime(self, job_id, runtime_memory):
         """
@@ -138,6 +154,7 @@ class Invoker:
         payload = {'config': self.config,
                    'chunksize': job.chunksize,
                    'log_level': self.log_level,
+                   'func_name': job.function_name,
                    'func_key': job.func_key,
                    'data_key': job.data_key,
                    'extra_env': job.extra_env,
@@ -161,12 +178,12 @@ class Invoker:
         """
         Run a job
         """
-        if self.customized_runtime:
-            logger.debug('ExecutorID {} | JobID {} - Customized runtime activated'
-                         .format(job.executor_id, job.job_id))
-            job.runtime_name = self.runtime_name
-            extend_runtime(job, self.compute_handler, self.internal_storage)
-            self.runtime_name = job.runtime_name
+        # if self.include_function:
+        #     logger.debug('ExecutorID {} | JobID {} - Runtime include function feature '
+        #                  ' is activated' .format(job.executor_id, job.job_id))
+        #     job.runtime_name = self.runtime_name
+        #     extend_runtime(job, self.compute_handler, self.internal_storage)
+        #     self.runtime_name = job.runtime_name
 
         logger.info('ExecutorID {} | JobID {} - Starting function '
                     'invocation: {}() - Total: {} activations'
@@ -481,8 +498,9 @@ def extend_runtime(job, compute_handler, internal_storage):
     """
 
     base_docker_image = job.runtime_name
-    uuid = job.ext_runtime_uuid
-    ext_runtime_name = "{}:{}".format(base_docker_image.split(":")[0], uuid)
+    # uuid = job.ext_runtime_uuid
+    uuid = 'ext'
+    ext_runtime_name = f'{base_docker_image.split(":")[0]}:{uuid}'
 
     # update job with new extended runtime name
     job.runtime_name = ext_runtime_name
@@ -498,10 +516,9 @@ def extend_runtime(job, compute_handler, internal_storage):
         # Generate Dockerfile extended with function dependencies and function
         with open(ext_docker_file, 'w') as df:
             df.write('\n'.join([
-                'FROM {}'.format(base_docker_image),
-                'ENV PYTHONPATH=/tmp/lithops/modules:$PYTHONPATH',
-                # set python path to point to dependencies folder
-                'COPY . /tmp/lithops'
+                f'FROM {base_docker_image}',
+                'ENV PYTHONPATH=/opt/lithops/modules:$PYTHONPATH',
+                'COPY . /opt/lithops'
             ]))
 
         # Build new extended runtime tagged by function hash

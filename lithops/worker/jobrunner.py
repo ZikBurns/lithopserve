@@ -27,7 +27,7 @@ import requests
 import traceback
 from pydoc import locate
 from distutils.util import strtobool
-
+from lithops.serverless.included_function.function import default_function
 from lithops.worker.utils import peak_memory
 
 try:
@@ -68,7 +68,7 @@ class JobRunner:
         self.jobrunner_conn = jobrunner_conn
         self.internal_storage = internal_storage
         self.lithops_config = job.config
-
+        self.alive = True
         self.output_key = create_output_key(job.executor_id, job.job_id, job.call_id)
 
         # Setup stats class
@@ -193,6 +193,9 @@ class JobRunner:
             return value
         return wrapper_decorator
 
+    def is_alive(self):
+        return self.alive
+
     @prepost
     def run(self):
         """
@@ -229,6 +232,8 @@ class JobRunner:
                     ('function_name', fn_name or 'undefined')
                 )
             )
+            if self.job.config['lithops'].get('runtime_include_function'):
+                data['installed_function'] = default_function
 
             logger.info("Going to execute '{}()'".format(str(fn_name)))
             print('---------------------- FUNCTION LOG ----------------------')
@@ -246,7 +251,7 @@ class JobRunner:
             if result is not None:
                 # Check for new futures
                 if isinstance(result, ResponseFuture) or isinstance(result, FuturesList) \
-                   or (type(result) == list and len(result) > 0 and isinstance(result[0], ResponseFuture)):
+                   or (type(result) is list and len(result) > 0 and isinstance(result[0], ResponseFuture)):
                     self.stats.write('new_futures', pickle.dumps(result))
                     result = None
                 else:
@@ -309,3 +314,4 @@ class JobRunner:
                 self.stats.write("worker_result_upload_time", round(output_upload_end_tstamp - output_upload_start_tstamp, 8))
             self.jobrunner_conn.send("Finished")
             logger.info("Process finished")
+            self.alive = False

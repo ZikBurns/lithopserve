@@ -176,9 +176,9 @@ def run_job(job):
         handler_conn, jobrunner_conn = Pipe()
         jobrunner = JobRunner(job, jobrunner_conn, internal_storage)
         logger.debug('Starting JobRunner process')
-        jrp = Process(target=jobrunner.run) if is_unix_system() else Thread(target=jobrunner.run)
-        jrp.start()
-        jrp.join(job.execution_timeout)
+        jobrunner.run()
+        jrp = jobrunner
+
         logger.debug('JobRunner process finished')
 
         if jrp.is_alive():

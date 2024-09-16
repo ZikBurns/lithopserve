@@ -15,6 +15,8 @@
 #
 
 import os
+import re
+import pika
 import base64
 import hashlib
 import json
@@ -23,6 +25,8 @@ import copy
 import time
 import yaml
 import urllib3
+import pickle
+
 from kubernetes import client, watch
 from kubernetes.config import load_kube_config, \
     load_incluster_config, list_kube_config_contexts, \
@@ -32,6 +36,7 @@ from kubernetes.client.rest import ApiException
 from lithops import utils
 from lithops.version import __version__
 from lithops.constants import COMPUTE_CLI_MSG, JOBS_PREFIX
+from lithops.job.job_installed_function import job_installed_function
 
 from . import config
 
@@ -96,7 +101,7 @@ class KubernetesBackend:
         logger.info(f"{msg} - Namespace: {self.namespace}")
 
     def _format_job_name(self, runtime_name, runtime_memory, version=__version__):
-        name = f'{runtime_name}-{runtime_memory}-{version}'
+        name = f'{runtime_name}-{runtime_memory}-{version}-{self.user}'
         name_hash = hashlib.sha1(name.encode()).hexdigest()[:10]
 
         return f'lithops-worker-{version.replace(".", "")}-{name_hash}'
@@ -113,6 +118,11 @@ class KubernetesBackend:
         """
         Builds a new runtime from a Docker file and pushes it to the registry
         """
+        func_str = pickle.dumps(job_installed_function)
+        func_module_str = pickle.dumps({'func': func_str, 'module_data': {}}, -1)
+        with open('func.pickle', 'wb') as f:
+            f.write(func_module_str)
+
         logger.info(f'Building runtime {docker_image_name} from {dockerfile or "Dockerfile"}')
 
         docker_path = utils.get_docker_path()
@@ -231,7 +241,56 @@ class KubernetesBackend:
         """
         Deletes a runtime
         """
-        pass
+        job_name_pattern = self._format_job_name(docker_image_name, memory, version)
+
+        docker_path = utils.get_docker_path()
+        docker_user = self.k8s_config.get("docker_user")
+        docker_password = self.k8s_config.get("docker_password")
+        docker_server = self.k8s_config.get("docker_server")
+
+        if docker_user and docker_password:
+            logger.debug('Container registry credentials found in config. Logging in into the registry')
+            cmd = f'{docker_path} login -u {docker_user} --password-stdin {docker_server}'
+            utils.run_command(cmd, input=docker_password)
+
+
+        logger.info(f'Deleting Docker image {docker_image_name} in remote')
+        cmd = f'{docker_path} image rm {docker_image_name}'
+
+        try:
+            utils.run_command(cmd)
+            logger.info(f'Removed Docker image {docker_image_name} in remote')
+        except Exception as e:
+            logger.error(f"Failed to delete image: {docker_image_name} in remote")
+
+        logger.info(f"Deleting runtime: {docker_image_name} locally")
+        cmd = f'{docker_path} rmi {docker_image_name}'
+        try:
+            utils.run_command(cmd)
+            logger.info(f'Removed Docker image {docker_image_name} locally')
+        except Exception as e:
+            logger.error(f"Failed to delete image: {docker_image_name} locally")
+
+        # Delete the Kubernetes Deployment
+        try:
+            logger.debug(f"Deleting job: {job_name_pattern}")
+            self.batch_api.delete_namespaced_job(
+                name=job_name_pattern,
+                namespace=self.namespace,
+                propagation_policy='Background'
+            )
+        except ApiException as e:
+            logger.error(f"Failed to delete job: {job_name_pattern}. Reason: {str(e)}")
+
+        # 2. Delete the container registry secret
+        try:
+            logger.debug("Deleting container registry secret")
+            self.core_api.delete_namespaced_secret("lithops-regcred", self.namespace)
+        except ApiException as e:
+            if e.status != 404:
+                logger.error(f"Failed to delete secret: lithops-regcred. Reason: {str(e)}")
+
+
 
     def clean(self, all=False):
         """
@@ -240,6 +299,7 @@ class KubernetesBackend:
         logger.debug('Cleaning lithops resources in kubernetes')
 
         try:
+            self._delete_workers()
             jobs = self.batch_api.list_namespaced_job(
                 namespace=self.namespace,
                 label_selector=f'user={self.user}'
@@ -291,6 +351,122 @@ class KubernetesBackend:
         logger.debug('Note that this backend does not manage runtimes')
         return []
 
+    def _create_pod(self, pod, pod_name, cpu, memory, gpu=False):
+        pod["metadata"]["name"] = f"lithops-pod-{pod_name}"
+        node_name = re.sub(r'-\d+$', '', pod_name)
+        pod["spec"]["nodeName"] = node_name
+        pod["spec"]["containers"][0]["image"] = self.image
+        pod["spec"]["containers"][0]["resources"]["requests"]["cpu"] = str(cpu)
+        pod["spec"]["containers"][0]["resources"]["requests"]["memory"] = memory
+        pod["metadata"]["labels"] = {"app": "lithops-pod"}
+
+        # Add GPU resource request if GPU is enabled
+        if gpu:
+            pod["spec"]["containers"][0]["resources"]["requests"]["nvidia.com/gpu"] = str(gpu)
+
+        payload = {
+            'log_level': 'DEBUG',
+            'amqp_url': self.amqp_url,
+            'cpus_pod': cpu,
+        }
+
+        pod["spec"]["containers"][0]["args"][1] = "start_rabbitmq"
+        pod["spec"]["containers"][0]["args"][2] = utils.dict_to_b64str(payload)
+
+        self.core_api.create_namespaced_pod(body=pod, namespace=self.namespace)
+
+    def _get_nodes(self):
+        self.nodes = []
+        list_all_nodes = self.core_api.list_node()
+        for node in list_all_nodes.items:
+            # If the node is tainted, skip it
+            if node.spec.taints:
+                continue
+
+            # Check if the CPU is in millicores
+            if isinstance(node.status.allocatable['cpu'], str) and 'm' in node.status.allocatable['cpu']:
+                # Extract the number part and convert it to an integer
+                number_match = re.search(r'\d+', node.status.allocatable['cpu'])
+                if number_match:
+                    number = int(number_match.group())
+
+                    # Round to the nearest whole number of CPUs - 1
+                    cpu_info = round(number / 1000) - 1
+
+                    if cpu_info < 1:
+                        cpu_info = 0
+                else:
+                    # Handle the case where the CPU is in millicores but no number is found
+                    cpu_info = 0
+            else:
+                # CPU is not in millicores
+                cpu_info = node.status.allocatable['cpu']
+
+            self.nodes.append({
+                "name": node.metadata.name,
+                "cpu": cpu_info,
+                "memory": node.status.allocatable['memory']
+            })
+
+    def _create_workers(self, runtime_memory):
+        default_pod_config = yaml.load(config.POD, Loader=yaml.loader.SafeLoader)
+        granularity = self.k8s_config['worker_processes']
+        cluster_info_cpu = {}
+        cluster_info_mem = {}
+        num_cpus_cluster = 0
+
+        if granularity <= 1:
+            granularity = False
+
+        for node in self.nodes:
+            cpus_node = int(float(node["cpu"]) * 0.9)
+
+            if granularity:
+                times, res = divmod(cpus_node, granularity)
+
+                for i in range(times):
+                    cluster_info_cpu[f"{node['name']}-{i}"] = granularity
+                    cluster_info_mem[f"{node['name']}-{i}"] = runtime_memory
+                    num_cpus_cluster += granularity
+                if res != 0:
+                    cluster_info_cpu[f"{node['name']}-{times}"] = res
+                    cluster_info_mem[f"{node['name']}-{times}"] = runtime_memory
+                    num_cpus_cluster += res
+            else:
+                cluster_info_cpu[node["name"] + "-0"] = cpus_node
+                num_cpus_cluster += cpus_node
+
+                # If runtime_memory is not defined in the config, use 80% of the node memory
+                if runtime_memory == 512:
+                    mem_num, mem_uni = re.match(r'(\d+)(\D*)', node["memory"]).groups()
+                    mem_num = int(float(mem_num) * 0.8)
+                    cluster_info_mem[node["name"] + "-0"] = f"{mem_num}{mem_uni}"
+                else:
+                    cluster_info_mem[node["name"] + "-0"] = str(runtime_memory)
+
+        if num_cpus_cluster == 0:
+            raise ValueError("Total CPUs of the cluster cannot be 0")
+
+        # Create all the pods
+        for pod_name in cluster_info_cpu.keys():
+            self._create_pod(default_pod_config, pod_name, cluster_info_cpu[pod_name], cluster_info_mem[pod_name])
+
+        logger.info(f"Total cpus of the cluster: {num_cpus_cluster}")
+
+    def _delete_workers(self):
+        list_pods = self.core_api.list_namespaced_pod(self.namespace, label_selector="app=lithops-pod")
+        for pod in list_pods.items:
+            self.core_api.delete_namespaced_pod(pod.metadata.name, self.namespace)
+
+        # Wait until all pods are deleted
+        while True:
+            list_pods = self.core_api.list_namespaced_pod(self.namespace, label_selector="app=lithops-pod")
+
+            if not list_pods.items:
+                break  # All pods are deleted
+
+        logger.info('All pods are deleted.')
+
     def _start_master(self, docker_image_name):
 
         master_pod = self.core_api.list_namespaced_pod(
@@ -317,6 +493,7 @@ class KubernetesBackend:
         master_res['metadata']['namespace'] = self.namespace
         master_res['metadata']['labels']['version'] = 'lithops_v' + __version__
         master_res['metadata']['labels']['user'] = self.user
+        master_res['spec']['template']['spec']['containers'][0]['resources'] = config.MASTER_CONFIG_RESOURCES
 
         container = master_res['spec']['template']['spec']['containers'][0]
         container['image'] = docker_image_name
@@ -344,6 +521,70 @@ class KubernetesBackend:
             if event['object'].status.phase == "Running":
                 w.stop()
                 return event['object'].status.pod_ip
+
+    # Detect if granularity, memory or runtime image changed or not
+    def _has_config_changed(self, runtime_mem):
+        config_granularity = False if self.k8s_config['worker_processes'] <= 1 else self.k8s_config['worker_processes']
+        config_memory = self.k8s_config['runtime_memory'] if self.k8s_config['runtime_memory'] != 512 else False
+
+        self.current_runtime = ""
+
+        list_pods = self.core_api.list_namespaced_pod(self.namespace, label_selector="app=lithops-pod")
+
+        for pod in list_pods.items:
+            pod_name = pod.metadata.name
+
+            # Get the node info where the pod is running
+            node_info = next((node for node in self.nodes if node["name"] == pod.spec.node_name), False)
+            if not node_info:
+                return True
+
+            # Get the pod info
+            self.current_runtime = pod.spec.containers[0].image
+            pod_resource_cpu = int(pod.spec.containers[0].resources.requests.get('cpu', '0m'))
+            pod_resource_memory = pod.spec.containers[0].resources.requests.get('memory', '0Mi')
+
+            multiples_pods_per_node = re.search(r'-\d+(?<!-0)$', pod_name)
+
+            node_cpu = int(float(node_info["cpu"]) * 0.9)
+            node_mem_num, node_mem_uni = re.match(r'(\d+)(\D*)', node_info["memory"]).groups()
+            pod_mem_num, pod_mem_uni = re.match(r'(\d+)(\D*)', pod_resource_memory).groups()
+
+            pod_mem_num = int(pod_mem_num)
+            node_mem_num = int(float(node_mem_num) * 0.8)
+
+            # There are pods with cpu granularity
+            if multiples_pods_per_node:
+                # Is lithops pod with granularity and the user doesn't want it
+                if not config_granularity:
+                    return True
+                # There is granularity but the pod doesn't have the default memory
+                if not config_memory and pod_mem_num != runtime_mem:
+                    return True
+                # There is granularity but the pod doesn't have the desired memory
+                if config_memory and pod_mem_num != config_memory:
+                    return True
+            else:
+                # There is a custom memory but the pod doesn't have the desired memory
+                if config_memory:
+                    if pod_mem_num != config_memory:
+                        return True
+                # The pod has custom_memory and the user doesn't want it
+                else:
+                    if pod_mem_num != node_mem_num and pod_mem_num != runtime_mem:
+                        return True
+
+            # The cpu granularity changed
+            if config_granularity:
+                node_granularity_cpu = node_cpu % config_granularity
+                if pod_resource_cpu != config_granularity and pod_resource_cpu != node_granularity_cpu:
+                    return True
+
+        # The runtime image changed
+        if self.current_runtime and self.current_runtime != self.image:
+            return True
+
+        return False
 
     def invoke(self, docker_image_name, runtime_memory, job_payload):
         """
@@ -405,7 +646,7 @@ class KubernetesBackend:
         return activation_id
 
     def _generate_runtime_meta(self, docker_image_name):
-        runtime_name = self._format_job_name(docker_image_name, 128)
+        runtime_name = self._format_job_name(docker_image_name, 512)
         meta_job_name = f'{runtime_name}-meta'
 
         logger.info(f"Extracting metadata from: {docker_image_name}")
@@ -494,9 +735,8 @@ class KubernetesBackend:
         Runtime keys are used to uniquely identify runtimes within the storage,
         in order to know which runtimes are installed and which not.
         """
-        jobdef_name = self._format_job_name(docker_image_name, 256, version)
-        user_hash = hashlib.sha1(self.user.encode()).hexdigest()[:6]
-        user_data = os.path.join(self.cluster, self.namespace, user_hash)
+        jobdef_name = self._format_job_name(docker_image_name, 512, version)
+        user_data = os.path.join(self.cluster, self.namespace, self.user)
         runtime_key = os.path.join(self.name, version, user_data, jobdef_name)
 
         return runtime_key

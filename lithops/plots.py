@@ -24,30 +24,30 @@ import pandas as pd
 import seaborn as sns
 import matplotlib.patches as mpatches
 from matplotlib.collections import LineCollection
+from matplotlib import pyplot as plt  # Import pyplot module
 
 sns.set_style('whitegrid')
 pylab.switch_backend("Agg")
 logger = logging.getLogger(__name__)
 
 
-def create_timeline(fs, dst):
-    stats = [f.stats for f in fs]
+def create_timeline(stats, dst, figsize=(10, 6), return_plot=False, show_plot=False):
     host_job_create_tstamp = min([cm['host_job_create_tstamp'] for cm in stats])
 
     stats_df = pd.DataFrame(stats)
     total_calls = len(stats_df)
 
-    palette = sns.color_palette("deep", 6)
+    palette = sns.color_palette("deep", 10)
 
-    fig = pylab.figure(figsize=(10, 6))
+    fig = plt.figure(figsize=figsize)
     ax = fig.add_subplot(1, 1, 1)
 
     y = np.arange(total_calls)
     point_size = 10
 
     fields = [('host submit', stats_df.host_submit_tstamp - host_job_create_tstamp),
-              ('call start', stats_df.worker_start_tstamp - host_job_create_tstamp),
-              ('call done', stats_df.worker_end_tstamp - host_job_create_tstamp),
+              ('function start', stats_df.worker_func_start_tstamp - host_job_create_tstamp),
+              ('function done', stats_df.worker_func_end_tstamp - host_job_create_tstamp),
               ('status fetched', stats_df.host_status_done_tstamp - host_job_create_tstamp)]
 
     if 'host_result_done_tstamp' in stats_df:
@@ -55,7 +55,7 @@ def create_timeline(fs, dst):
 
     patches = []
     for f_i, (field_name, val) in enumerate(fields):
-        ax.scatter(val, y, c=[palette[f_i]], edgecolor='none', s=point_size, alpha=0.8)
+        ax.scatter(val, y + 1, c=[palette[f_i]], edgecolor='none', s=point_size, alpha=0.8)
         patches.append(mpatches.Patch(color=palette[f_i], label=field_name))
 
     ax.set_xlabel('Execution Time (sec)')

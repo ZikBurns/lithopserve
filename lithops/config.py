@@ -214,6 +214,10 @@ def default_config(config_file=None, config_data=None, config_overwrite={}, load
            and backend != c.LOCALHOST:
             raise Exception(f'Localhost storage backend cannot be used with {backend}')
 
+    backend = config_data['lithops']['backend']
+    if config_data[backend].get('runtime_include_function'):
+        config_data['lithops']['runtime_include_function'] = config_data[backend]['runtime_include_function']
+
     return config_data
 
 

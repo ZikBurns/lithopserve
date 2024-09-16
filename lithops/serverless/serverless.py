@@ -19,6 +19,7 @@ import logging
 import importlib
 
 logger = logging.getLogger(__name__)
+from lithops.version import __version__
 
 
 class ServerlessHandler:
@@ -69,6 +70,15 @@ class ServerlessHandler:
 
         return self.backend.invoke(runtime_name, runtime_memory, job_payload)
 
+    def invoke_sync(self, job_payload):
+        """
+        Invoke -- return information about this invocation
+        """
+        runtime_name = job_payload['runtime_name']
+        runtime_memory = job_payload['runtime_memory']
+
+        return self.backend.invoke_sync(runtime_name, runtime_memory, job_payload)
+
     def build_runtime(self, runtime_name, file, extra_args=[]):
         """
         Wrapper method to build a new runtime for the compute backend.
@@ -83,7 +93,7 @@ class ServerlessHandler:
         """
         return self.backend.deploy_runtime(runtime_name, memory, timeout=timeout)
 
-    def delete_runtime(self, runtime_name, memory, version):
+    def delete_runtime(self, runtime_name, memory, version=__version__):
         """
         Wrapper method to delete a runtime in the compute backend
         """

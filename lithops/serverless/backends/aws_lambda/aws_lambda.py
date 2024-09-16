@@ -17,12 +17,14 @@
 import os
 import logging
 import boto3
+import hashlib
 import time
 import json
 import zipfile
 import subprocess
 import botocore.exceptions
 import base64
+import pickle
 
 from botocore.httpsession import URLLib3Session
 from botocore.awsrequest import AWSRequest
@@ -31,6 +33,7 @@ from botocore.auth import SigV4Auth
 from lithops import utils
 from lithops.version import __version__
 from lithops.constants import COMPUTE_CLI_MSG
+from lithops.job.job_installed_function import job_installed_function
 
 from . import config
 
@@ -71,7 +74,8 @@ class AWSLambdaBackend:
         self.lambda_client = self.aws_session.client(
             'lambda', region_name=self.region_name,
             config=botocore.client.Config(
-                user_agent_extra=self.user_agent
+                user_agent_extra=self.user_agent,
+                max_pool_connections=2000
             )
         )
 
@@ -345,6 +349,11 @@ class AWSLambdaBackend:
         @param runtime_name: name of the runtime to be built
         @param runtime_file: path of a Dockerfile for a container runtime
         """
+        func_str = pickle.dumps(job_installed_function)
+        func_module_str = pickle.dumps({'func': func_str, 'module_data': {}}, -1)
+        with open('func.pickle', 'wb') as f:
+            f.write(func_module_str)
+
         logger.info(f'Building runtime {runtime_name} from {runtime_file}')
 
         docker_path = utils.get_docker_path()
@@ -554,30 +563,35 @@ class AWSLambdaBackend:
         logger.info(f'Deleting lambda runtime: {runtime_name} - {runtime_memory}MB')
         func_name = self._format_function_name(runtime_name, runtime_memory, version)
 
-        self._delete_function(func_name)
+        try:
+            self._delete_function(func_name)
+        except Exception as e:
+            logger.debug(e)
+        runtime_key = self.get_runtime_key(runtime_name, runtime_memory, __version__)
+        self.internal_storage.delete_runtime_meta(runtime_key)
 
-        # Check if layer/container image has to also be deleted
-        if not self.list_runtimes(runtime_name):
-            runtime_name = runtime_name.split('/', 1)[1] if '/' in runtime_name else runtime_name
-            if self._is_container_runtime(runtime_name):
-                if ':' in runtime_name:
-                    image, tag = runtime_name.split(':')
-                else:
-                    image, tag = runtime_name, 'latest'
-                package = '_'.join(func_name.split('_')[:3])
-                repo_name = f"{package}/{image}"
-                logger.debug(f'Going to delete ECR repository {repo_name} tag {tag}')
-                try:
-                    self.ecr_client.batch_delete_image(repositoryName=repo_name, imageIds=[{'imageTag': tag}])
-                    images = self.ecr_client.list_images(repositoryName=repo_name, filter={'tagStatus': 'TAGGED'})
-                    if not images['imageIds']:
-                        logger.debug(f'Going to delete ECR repository {repo_name}')
-                        self.ecr_client.delete_repository(repositoryName=repo_name, force=True)
-                except Exception:
-                    pass
-            else:
-                layer = self._format_layer_name(runtime_name, version)
-                self._delete_layer(layer)
+        # Also delete all the runtimes that were extended from this runtime
+        if self.lambda_config.get('runtime_include_function', True):
+            logger.info(f'Deleting lambda extended runtime: {runtime_name} - {runtime_memory}MB')
+            func_name = self._format_function_name(runtime_name+':ext', runtime_memory, version)
+            try:
+                self._delete_function(func_name)
+            except Exception as e:
+                logger.debug(e)
+            runtime_key = self.get_runtime_key(runtime_name+':ext', runtime_memory, __version__)
+            self.internal_storage.delete_runtime_meta(runtime_key)
+
+        # Delete ECR repository
+        if self._is_container_runtime(runtime_name):
+            repo_name = self._format_repo_name(runtime_name)
+            try:
+                self.ecr_client.delete_repository(repositoryName=repo_name, force=True)
+            except Exception as e:
+                logger.debug(f'Error deleting ECR repository: {e}. Skipping deletion.')
+
+        if not self._is_container_runtime(runtime_name):
+            layer = self._format_layer_name(runtime_name, version)
+            self._delete_layer(layer)
 
     def clean(self, **kwargs):
         """
@@ -679,6 +693,43 @@ class AWSLambdaBackend:
         #         raise Exception('Lithops Runtime: {} not deployed'.format(runtime_name))
         #     else:
         #         raise Exception(response)
+
+
+    def invoke_sync(self, runtime_name, runtime_memory, payload):
+        """
+        Invoke lambda function asynchronously
+        @param runtime_name: name of the runtime
+        @param runtime_memory: memory of the runtime in MB
+        @param payload: invoke dict payload
+        @return: invocation ID
+        """
+        # print("Starting invocation", payload)
+        function_name = self._format_function_name(runtime_name, runtime_memory)
+        payload['sync_invoker'] = True
+        # return None
+        # Save payload into json file
+        payload = json.dumps(payload, default=str)
+        print("Payload", payload)
+        try:
+            response = self.lambda_client.invoke(
+                FunctionName=function_name,
+                Payload=payload
+            )
+            if response['StatusCode'] == 200:
+                return json.loads(response['Payload'].read().decode('utf-8'))
+            else:
+                logger.debug(response)
+                if response['ResponseMetadata']['HTTPStatusCode'] == 401:
+                    raise Exception('Unauthorized - Invalid API Key')
+                elif response['ResponseMetadata']['HTTPStatusCode'] == 404:
+                    raise Exception('Lithops Runtime: {} not deployed'.format(runtime_name))
+                else:
+                    raise Exception(response)
+        except Exception as e:
+            # Reached the maximum number of attempts, raise an exception or perform any other action
+            raise Exception(f"Failed to invoke function: {e}")
+
+
 
     def get_runtime_key(self, runtime_name, runtime_memory, version=__version__):
         """
