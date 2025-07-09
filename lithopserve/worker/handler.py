@@ -43,6 +43,9 @@ from lithopserve.constants import JOBS_PREFIX, LITHOPS_TEMP_DIR, MODULES_DIR
 from lithopserve.utils import setup_lithops_logger, is_unix_system
 from lithopserve.worker.status import create_call_status
 from lithopserve.worker.utils import SystemMonitor
+from lithopserve.worker.profiler_context import profiling_context
+
+from lithopserve.util.metrics import PrometheusExporter
 
 pickling_support.install()
 
@@ -168,6 +171,38 @@ def prepare_and_run_task(task):
         os.environ.pop(key, None)
 
 
+def send_metrics(call_status, prometheus, job):
+    for metric_name, metric_value in call_status.status.items():
+        labels_dict = {
+            'job_id': job.job_id,
+            'call_id': job.call_id,
+            'executor_id': job.executor_id,
+        }
+
+        labels = list(labels_dict.items())
+
+        if isinstance(metric_value, list):
+            for index, value in enumerate(metric_value):
+                list_labels_dict = labels_dict.copy()
+                list_labels_dict['index'] = str(index)
+                list_labels = list(list_labels_dict.items())
+
+                prometheus.send_metric(
+                    name=metric_name,
+                    value=value,
+                    type='gauge',
+                    labels=list_labels
+                )
+
+        else:
+            prometheus.send_metric(
+                name=metric_name,
+                value=metric_value,
+                type='gauge',
+                labels=labels
+            )
+
+
 def run_task(task):
     """
     Runs a single job within a separate process
@@ -204,22 +239,31 @@ def run_task(task):
 
         handler_conn, jobrunner_conn = Pipe()
         jobrunner = JobRunner(task, jobrunner_conn, internal_storage)
+
+        prom_enabled = jobrunner.lithops_config['lithopserve'].get('telemetry')
+        prom_config = jobrunner.lithops_config.get('prometheus', {})
+        prometheus = PrometheusExporter(prom_enabled, prom_config)
+
+        profiler_timeout = jobrunner.lithops_config['lithopserve'].get('profiler_timeout')
+
         logger.debug('Starting JobRunner process')
-        if task.pid != 0:
-            jrp = Process(target=jobrunner.run) if is_unix_system() else Thread(target=jobrunner.run)
+        jrp = Process(target=jobrunner.run) if is_unix_system() else Thread(target=jobrunner.run)
 
         process_id = os.getpid() if is_unix_system() else mp.current_process().pid
+        jrp.start()
+
         sys_monitor = SystemMonitor(process_id)
         sys_monitor.start()
 
-        if task.pid != 0:
-            jrp.start()
-            jrp.join(task.execution_timeout)
+        if task.log_level == logging.DEBUG:
+            with profiling_context(jobrunner_conn, process_id, prometheus, jobrunner.job, profiler_timeout):
+                jrp.join(task.execution_timeout)
+            logger.debug('Profiling completed')
         else:
-            jobrunner.run()
-            jrp = jobrunner
+            jrp.join(task.execution_timeout)
 
         sys_monitor.stop()
+
         logger.debug('JobRunner process finished')
 
         cpu_info = sys_monitor.get_cpu_info()
